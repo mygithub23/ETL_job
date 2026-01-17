@@ -1,0 +1,18 @@
+{
+    "fileLocations": [
+        {
+            "URIPrefixes": [
+                "s3://ndjson-input-sqs-804450520964-dev/pipeline/input/2025-12-21-test0000-073030-670004b3-f376-11f0-89c4-6f21be1c9493.ndjson",
+                "s3://ndjson-input-sqs-804450520964-dev/pipeline/input/2025-12-21-test0000-073942-afebc07f-f377-11f0-9bc2-f5b728a5dcc1.ndjson",
+                "s3://ndjson-input-sqs-804450520964-dev/pipeline/input/2025-12-21-test0000-074501-6dde8239-f378-11f0-a4e9-f5b728a5dcc1.ndjson",
+                "s3://ndjson-input-sqs-804450520964-dev/pipeline/input/2025-12-21-test0001-073030-67194a47-f376-11f0-be35-6f21be1c9493.ndjson",
+                "s3://ndjson-input-sqs-804450520964-dev/pipeline/input/2025-12-21-test0001-073942-b009f0ae-f377-11f0-bacd-f5b728a5dcc1.ndjson",
+                "s3://ndjson-input-sqs-804450520964-dev/pipeline/input/2025-12-21-test0001-074501-6dfeb910-f378-11f0-9f38-f5b728a5dcc1.ndjson",
+                "s3://ndjson-input-sqs-804450520964-dev/pipeline/input/2025-12-21-test0002-073031-67362d72-f376-11f0-8ebc-6f21be1c9493.ndjson",
+                "s3://ndjson-input-sqs-804450520964-dev/pipeline/input/2025-12-21-test0002-073943-b02abc25-f377-11f0-a262-f5b728a5dcc1.ndjson",
+                "s3://ndjson-input-sqs-804450520964-dev/pipeline/input/2025-12-21-test0002-074501-6e1aff94-f378-11f0-833c-f5b728a5dcc1.ndjson",
+                "s3://ndjson-input-sqs-804450520964-dev/pipeline/input/2025-12-21-test0003-073031-6753905f-f376-11f0-b2a7-6f21be1c9493.ndjson"
+            ]
+        }
+    ]
+}
