@@ -1,0 +1,622 @@
+"""
+Lambda #1: Manifest Builder - DEVELOPMENT VERSION
+==================================================
+
+Enhanced version with extensive logging, try-catch blocks, and debugging features.
+
+Author: Data Engineering Team
+Version: 1.2.0-dev
+Environment: DEVELOPMENT
+
+Features:
+- Detailed logging for every operation
+- Try-catch blocks with full stack traces
+- Object introspection and dumps
+- Debug mode for verbose output
+"""
+
+import json
+import os
+import boto3
+import hashlib
+import time
+import re
+import traceback
+from datetime import datetime, timedelta
+from decimal import Decimal
+from typing import List, Dict, Tuple, Optional
+import logging
+
+# Configure detailed logging for development
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)  # DEBUG level for dev
+
+# AWS Clients
+s3_client = boto3.client('s3')
+dynamodb = boto3.resource('dynamodb')
+glue_client = boto3.client('glue')
+sfn_client = boto3.client('stepfunctions')
+
+# Environment Variables with validation
+try:
+    MANIFEST_BUCKET = os.environ['MANIFEST_BUCKET']
+    TRACKING_TABLE = os.environ['TRACKING_TABLE']
+    logger.info(f"✓ Environment loaded - Manifest bucket: {MANIFEST_BUCKET}, Tracking table: {TRACKING_TABLE}")
+except KeyError as e:
+    logger.error(f"✗ Missing required environment variable: {e}")
+    raise
+
+GLUE_JOB_NAME = os.environ.get('GLUE_JOB_NAME', '')
+MAX_FILES_PER_MANIFEST = int(os.environ.get('MAX_FILES_PER_MANIFEST', '10'))
+QUARANTINE_BUCKET = os.environ.get('QUARANTINE_BUCKET', '')
+EXPECTED_FILE_SIZE_MB = float(os.environ.get('EXPECTED_FILE_SIZE_MB', '3.5'))
+SIZE_TOLERANCE_PERCENT = float(os.environ.get('SIZE_TOLERANCE_PERCENT', '10'))
+LOCK_TABLE = os.environ.get('LOCK_TABLE', TRACKING_TABLE)
+LOCK_TTL_SECONDS = int(os.environ.get('LOCK_TTL_SECONDS', '300'))
+STEP_FUNCTION_ARN = os.environ.get('STEP_FUNCTION_ARN', '')
+
+# Log all configuration
+logger.info(f"Configuration: MAX_FILES_PER_MANIFEST={MAX_FILES_PER_MANIFEST}, EXPECTED_FILE_SIZE_MB={EXPECTED_FILE_SIZE_MB}")
+logger.info(f"Configuration: SIZE_TOLERANCE_PERCENT={SIZE_TOLERANCE_PERCENT}, LOCK_TTL_SECONDS={LOCK_TTL_SECONDS}")
+
+# DynamoDB table
+table = dynamodb.Table(TRACKING_TABLE)
+
+
+class DistributedLock:
+    """Distributed lock with enhanced logging for development."""
+
+    def __init__(self, lock_table: str, lock_key: str, ttl_seconds: int = 300):
+        self.table = dynamodb.Table(lock_table)
+        self.lock_key = lock_key
+        self.ttl_seconds = ttl_seconds
+        self.lock_id = f"{os.environ.get('AWS_LAMBDA_LOG_STREAM_NAME', 'local')}_{int(time.time() * 1000)}"
+        self.acquired = False
+        logger.debug(f"🔒 Lock object created - Key: {lock_key}, ID: {self.lock_id}, TTL: {ttl_seconds}s")
+
+    def acquire(self) -> bool:
+        """Attempt to acquire the lock with detailed logging."""
+        try:
+            ttl = int(time.time()) + self.ttl_seconds
+            logger.debug(f"🔒 Attempting to acquire lock: {self.lock_key}")
+
+            self.table.put_item(
+                Item={
+                    'date_prefix': f'LOCK#{self.lock_key}',
+                    'file_key': 'LOCK',  # Range key in DynamoDB
+                    'lock_id': self.lock_id,
+                    'ttl': ttl,
+                    'created_at': datetime.utcnow().isoformat()
+                },
+                ConditionExpression='attribute_not_exists(date_prefix) OR #ttl < :now',
+                ExpressionAttributeNames={'#ttl': 'ttl'},
+                ExpressionAttributeValues={':now': int(time.time())}
+            )
+            self.acquired = True
+            logger.info(f"✓ Lock acquired successfully: {self.lock_key}")
+            return True
+        except dynamodb.meta.client.exceptions.ConditionalCheckFailedException as e:
+            logger.warning(f"✗ Lock already held by another process: {self.lock_key}")
+            logger.debug(f"Lock conflict details: {str(e)}")
+            return False
+        except Exception as e:
+            logger.error(f"✗ Unexpected error acquiring lock: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return False
+
+    def release(self):
+        """Release the lock with logging."""
+        if not self.acquired:
+            logger.debug(f"🔒 No lock to release for: {self.lock_key}")
+            return
+
+        try:
+            logger.debug(f"🔒 Releasing lock: {self.lock_key}")
+            self.table.delete_item(
+                Key={
+                    'date_prefix': f'LOCK#{self.lock_key}',
+                    'file_key': 'LOCK'  # Range key in DynamoDB
+                },
+                ConditionExpression='lock_id = :lock_id',
+                ExpressionAttributeValues={':lock_id': self.lock_id}
+            )
+            self.acquired = False
+            logger.info(f"✓ Lock released: {self.lock_key}")
+        except Exception as e:
+            logger.error(f"✗ Error releasing lock: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+
+
+def lambda_handler(event, context):
+    """
+    Main Lambda handler with comprehensive error handling and logging.
+    """
+    logger.info("=" * 80)
+    logger.info("🚀 Lambda invocation started")
+    logger.info(f"Request ID: {context.aws_request_id}")
+    logger.info(f"Function: {context.function_name}")
+    logger.info(f"Memory: {context.memory_limit_in_mb}MB")
+    logger.info(f"Time remaining: {context.get_remaining_time_in_millis()}ms")
+    logger.info("=" * 80)
+
+    try:
+        # Log full event for debugging
+        logger.debug(f"📥 Event received: {json.dumps(event, indent=2, default=str)}")
+
+        # Extract SQS records
+        records = event.get('Records', [])
+        logger.info(f"📨 Processing {len(records)} SQS records")
+
+        if not records:
+            logger.warning("⚠️  No records in event")
+            return {'statusCode': 200, 'body': json.dumps('No records to process')}
+
+        files_processed = 0
+        files_quarantined = 0
+        errors = []
+
+        for idx, record in enumerate(records, 1):
+            try:
+                logger.info(f"📄 Processing record {idx}/{len(records)}")
+                logger.debug(f"Record details: {json.dumps(record, indent=2, default=str)}")
+
+                # Parse S3 event from SQS message
+                s3_event = json.loads(record['body'])
+                logger.debug(f"S3 event: {json.dumps(s3_event, indent=2)}")
+
+                s3_records = s3_event.get('Records', [])
+                logger.info(f"   Contains {len(s3_records)} S3 event(s)")
+
+                for s3_record in s3_records:
+                    try:
+                        bucket = s3_record['s3']['bucket']['name']
+                        key = s3_record['s3']['object']['key']
+                        size = s3_record['s3']['object']['size']
+
+                        logger.info(f"   📁 File: s3://{bucket}/{key}")
+                        logger.info(f"      Size: {size} bytes ({size / (1024**2):.2f} MB)")
+
+                        # Validate and process file
+                        result = process_file(bucket, key, size)
+
+                        if result == 'processed':
+                            files_processed += 1
+                            logger.info(f"   ✓ File processed successfully")
+                        elif result == 'quarantined':
+                            files_quarantined += 1
+                            logger.warning(f"   ⚠️  File quarantined")
+
+                    except Exception as e:
+                        error_msg = f"Error processing S3 record: {str(e)}"
+                        logger.error(f"   ✗ {error_msg}")
+                        logger.error(f"   Traceback: {traceback.format_exc()}")
+                        errors.append(error_msg)
+
+            except Exception as e:
+                error_msg = f"Error processing SQS record {idx}: {str(e)}"
+                logger.error(f"✗ {error_msg}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                errors.append(error_msg)
+
+        # Summary
+        logger.info("=" * 80)
+        logger.info(f"📊 Processing Summary:")
+        logger.info(f"   ✓ Files processed: {files_processed}")
+        logger.info(f"   ⚠️  Files quarantined: {files_quarantined}")
+        logger.info(f"   ✗ Errors: {len(errors)}")
+        if errors:
+            logger.error(f"   Error details: {json.dumps(errors, indent=2)}")
+        logger.info("=" * 80)
+
+        return {
+            'statusCode': 200 if not errors else 207,
+            'body': json.dumps({
+                'processed': files_processed,
+                'quarantined': files_quarantined,
+                'errors': len(errors),
+                'errorDetails': errors if errors else None
+            }, default=str)
+        }
+
+    except Exception as e:
+        logger.error("=" * 80)
+        logger.error(f"💥 FATAL ERROR in lambda_handler")
+        logger.error(f"Error: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        logger.error("=" * 80)
+        raise
+
+
+def process_file(bucket: str, key: str, size: int) -> str:
+    """Process a single file with detailed logging."""
+    try:
+        logger.debug(f"🔍 Validating file: {key}")
+
+        # Validate file
+        is_valid, reason = validate_file(key, size)
+
+        if not is_valid:
+            logger.warning(f"⚠️  Validation failed: {reason}")
+            quarantine_file(bucket, key, reason)
+            return 'quarantined'
+
+        logger.debug(f"✓ File validation passed")
+
+        # Track in DynamoDB
+        date_prefix, file_name = extract_date_and_filename(key)
+        logger.debug(f"📅 Date prefix: {date_prefix}, File name: {file_name}")
+
+        track_file(bucket, key, date_prefix, file_name, size)
+        logger.debug(f"✓ File tracked in DynamoDB")
+
+        # Check if ready for manifest
+        logger.debug(f"🔍 Checking if ready to create manifests for {date_prefix}")
+        manifests_created = create_manifests_if_ready(date_prefix)
+
+        if manifests_created > 0:
+            logger.info(f"✓ Created {manifests_created} manifest(s) for {date_prefix}")
+        else:
+            logger.debug(f"ℹ️  Not ready for manifest yet")
+
+        return 'processed'
+
+    except Exception as e:
+        logger.error(f"✗ Error in process_file: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
+
+
+def validate_file(key: str, size: int) -> Tuple[bool, str]:
+    """Validate file with logging."""
+    try:
+        logger.debug(f"Validating: key={key}, size={size}")
+
+        # Check file extension
+        if not key.endswith('.ndjson'):
+            return False, f"Invalid extension (expected .ndjson)"
+
+        # Check file size
+        size_mb = size / (1024 * 1024)
+        min_size = EXPECTED_FILE_SIZE_MB * (1 - SIZE_TOLERANCE_PERCENT / 100)
+        max_size = EXPECTED_FILE_SIZE_MB * (1 + SIZE_TOLERANCE_PERCENT / 100)
+
+        logger.debug(f"Size check: {size_mb:.2f}MB (expected: {min_size:.2f}-{max_size:.2f}MB)")
+
+        if size_mb < min_size or size_mb > max_size:
+            return False, f"Size {size_mb:.2f}MB outside expected range {min_size:.2f}-{max_size:.2f}MB"
+
+        return True, "OK"
+
+    except Exception as e:
+        logger.error(f"Error in validate_file: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return False, f"Validation error: {str(e)}"
+
+
+def quarantine_file(bucket: str, key: str, reason: str):
+    """Quarantine invalid file with logging."""
+    try:
+        if not QUARANTINE_BUCKET:
+            logger.warning(f"⚠️  QUARANTINE_BUCKET not set, skipping quarantine")
+            return
+
+        logger.info(f"🗑️  Quarantining file to s3://{QUARANTINE_BUCKET}/{key}")
+        logger.info(f"   Reason: {reason}")
+
+        s3_client.copy_object(
+            Bucket=QUARANTINE_BUCKET,
+            Key=key,
+            CopySource={'Bucket': bucket, 'Key': key},
+            Metadata={'quarantine_reason': reason, 'original_bucket': bucket}
+        )
+
+        logger.info(f"✓ File quarantined successfully")
+
+    except Exception as e:
+        logger.error(f"✗ Error quarantining file: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
+
+
+def extract_date_and_filename(key: str) -> Tuple[str, str]:
+    """Extract date and filename from S3 key."""
+    try:
+        parts = key.split('/')
+        filename = parts[-1]
+
+        # Try to find YYYY-MM-DD pattern in key
+        match = re.search(r'(\d{4}-\d{2}-\d{2})', key)
+        if match:
+            date_prefix = match.group(1)
+        else:
+            # Fallback to current date
+            date_prefix = datetime.utcnow().strftime('%Y-%m-%d')
+            logger.warning(f"⚠️  No date found in key, using current date: {date_prefix}")
+
+        logger.debug(f"Extracted: date={date_prefix}, filename={filename}")
+        return date_prefix, filename
+
+    except Exception as e:
+        logger.error(f"Error extracting date/filename: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
+
+
+def track_file(bucket: str, key: str, date_prefix: str, file_name: str, size: int):
+    """Track file in DynamoDB with logging."""
+    try:
+        # Note: DynamoDB table uses 'file_key' as the range key (not 'file_name')
+        item = {
+            'date_prefix': date_prefix,
+            'file_key': file_name,  # Range key in DynamoDB
+            'file_path': f's3://{bucket}/{key}',
+            'file_size_mb': Decimal(str(size / (1024 * 1024))),
+            'status': 'pending',
+            'created_at': datetime.utcnow().isoformat()
+        }
+
+        logger.debug(f"📝 Writing to DynamoDB: {json.dumps(item, indent=2, default=str)}")
+
+        table.put_item(Item=item)
+
+        logger.debug(f"✓ Item written to DynamoDB")
+
+    except Exception as e:
+        logger.error(f"✗ Error tracking file: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
+
+
+def create_manifests_if_ready(date_prefix: str) -> int:
+    """Check if ready to create manifests based on file count threshold."""
+    lock = DistributedLock(LOCK_TABLE, f'manifest-{date_prefix}', LOCK_TTL_SECONDS)
+
+    try:
+        # Try to acquire lock
+        if not lock.acquire():
+            logger.info(f"ℹ️  Another process is handling manifests for {date_prefix}")
+            return 0
+
+        logger.debug(f"🔍 Getting pending files for {date_prefix}")
+
+        # Get pending files
+        all_files = _get_pending_files(date_prefix)
+        logger.info(f"📦 Found {len(all_files)} pending files (threshold: {MAX_FILES_PER_MANIFEST})")
+
+        if not all_files:
+            logger.debug(f"No pending files for {date_prefix}")
+            return 0
+
+        # Log file details in dev
+        for i, file_info in enumerate(all_files[:5], 1):  # Log first 5
+            logger.debug(f"   File {i}: {file_info['filename']} ({file_info['size_mb']:.2f}MB)")
+        if len(all_files) > 5:
+            logger.debug(f"   ... and {len(all_files) - 5} more files")
+
+        # Check if we have enough files to create a manifest
+        if len(all_files) < MAX_FILES_PER_MANIFEST:
+            logger.info(f"ℹ️  Not enough files yet: {len(all_files)} < {MAX_FILES_PER_MANIFEST}")
+            return 0
+
+        logger.info(f"✓ File threshold reached! Creating manifests...")
+
+        # Create batches (each batch has MAX_FILES_PER_MANIFEST files)
+        batches = _create_batches(all_files)
+        logger.info(f"📦 Created {len(batches)} batch(es)")
+
+        for i, batch in enumerate(batches, 1):
+            batch_size_mb = sum(f['size_bytes'] for f in batch) / (1024**2)
+            logger.debug(f"   Batch {i}: {len(batch)} files, {batch_size_mb:.2f}MB")
+
+        # Create manifests
+        manifests_created = 0
+        for batch_idx, batch_files in enumerate(batches, 1):
+            try:
+                logger.debug(f"📝 Creating manifest {batch_idx}/{len(batches)}")
+                manifest_path = _create_manifest(date_prefix, batch_idx, batch_files)
+
+                if manifest_path:
+                    manifests_created += 1
+                    logger.info(f"✓ Manifest created: {manifest_path}")
+
+                    # Update file status
+                    _update_file_status(batch_files, 'manifested', manifest_path)
+                    logger.debug(f"✓ Updated {len(batch_files)} file statuses")
+
+                    # Trigger Step Functions workflow
+                    start_step_function(manifest_path, date_prefix, len(batch_files))
+
+            except Exception as e:
+                logger.error(f"✗ Error creating manifest {batch_idx}: {str(e)}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+
+        return manifests_created
+
+    except Exception as e:
+        logger.error(f"✗ Error in create_manifests_if_ready: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return 0
+
+    finally:
+        lock.release()
+
+
+def _get_pending_files(date_prefix: str) -> List[Dict]:
+    """Get all pending files with pagination and logging."""
+    try:
+        files = []
+        last_evaluated_key = None
+        page = 0
+
+        while True:
+            page += 1
+            logger.debug(f"📄 Querying DynamoDB page {page}")
+
+            query_params = {
+                'KeyConditionExpression': 'date_prefix = :prefix',
+                'FilterExpression': '#status = :status',
+                'ExpressionAttributeNames': {'#status': 'status'},
+                'ExpressionAttributeValues': {
+                    ':prefix': date_prefix,
+                    ':status': 'pending'
+                }
+            }
+
+            if last_evaluated_key:
+                query_params['ExclusiveStartKey'] = last_evaluated_key
+
+            response = table.query(**query_params)
+
+            logger.debug(f"   Retrieved {len(response.get('Items', []))} items")
+
+            for item in response.get('Items', []):
+                files.append({
+                    'bucket': item['file_path'].split('/')[2],
+                    'key': '/'.join(item['file_path'].split('/')[3:]),
+                    'filename': item['file_key'],  # Range key in DynamoDB (not 'file_name')
+                    'size_bytes': int(float(item['file_size_mb']) * 1024 * 1024),
+                    'size_mb': float(item['file_size_mb']),
+                    'date_prefix': item['date_prefix'],
+                    's3_path': item['file_path']
+                })
+
+            last_evaluated_key = response.get('LastEvaluatedKey')
+            if not last_evaluated_key:
+                break
+
+            logger.debug(f"   More pages available, continuing...")
+
+        logger.info(f"✓ Retrieved {len(files)} total files from {page} page(s)")
+        return files
+
+    except Exception as e:
+        logger.error(f"✗ Error querying pending files: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return []
+
+
+def _create_batches(files: List[Dict]) -> List[List[Dict]]:
+    """Create batches based on MAX_FILES_PER_MANIFEST."""
+    try:
+        logger.debug(f"📦 Creating batches from {len(files)} files (max {MAX_FILES_PER_MANIFEST} per batch)")
+
+        batches = []
+
+        # Split files into batches of MAX_FILES_PER_MANIFEST
+        for i in range(0, len(files), MAX_FILES_PER_MANIFEST):
+            batch = files[i:i + MAX_FILES_PER_MANIFEST]
+            # Only create full batches (don't create partial batches)
+            if len(batch) == MAX_FILES_PER_MANIFEST:
+                batches.append(batch)
+                batch_size_mb = sum(f['size_bytes'] for f in batch) / (1024**2)
+                logger.debug(f"   Batch {len(batches)}: {len(batch)} files, {batch_size_mb:.2f}MB")
+            else:
+                logger.debug(f"   Holding partial batch: {len(batch)} files (need {MAX_FILES_PER_MANIFEST})")
+
+        logger.info(f"✓ Created {len(batches)} batch(es)")
+        return batches
+
+    except Exception as e:
+        logger.error(f"✗ Error creating batches: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return []
+
+
+def _create_manifest(date_prefix: str, batch_idx: int, files: List[Dict]) -> Optional[str]:
+    """Create manifest file with logging."""
+    try:
+        timestamp = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+        manifest_key = f'manifests/{date_prefix}/batch-{batch_idx:04d}-{timestamp}.json'
+
+        logger.debug(f"📝 Creating manifest: {manifest_key}")
+        logger.debug(f"   Files in manifest: {len(files)}")
+
+        # Build manifest
+        manifest = {
+            'fileLocations': [
+                {
+                    'URIPrefixes': [f['s3_path'] for f in files]
+                }
+            ]
+        }
+
+        logger.debug(f"   Manifest content: {json.dumps(manifest, indent=2)}")
+
+        # Upload to S3
+        s3_client.put_object(
+            Bucket=MANIFEST_BUCKET,
+            Key=manifest_key,
+            Body=json.dumps(manifest),
+            ContentType='application/json'
+        )
+
+        manifest_path = f's3://{MANIFEST_BUCKET}/{manifest_key}'
+        logger.info(f"✓ Manifest uploaded: {manifest_path}")
+
+        return manifest_path
+
+    except Exception as e:
+        logger.error(f"✗ Error creating manifest: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return None
+
+
+def _update_file_status(files: List[Dict], status: str, manifest_path: str):
+    """Update file status with logging."""
+    try:
+        logger.debug(f"📝 Updating status for {len(files)} files to '{status}'")
+
+        updated = 0
+        for file_info in files:
+            try:
+                table.update_item(
+                    Key={
+                        'date_prefix': file_info['date_prefix'],
+                        'file_key': file_info['filename']  # Range key in DynamoDB
+                    },
+                    UpdateExpression='SET #status = :status, manifest_path = :manifest, updated_at = :updated',
+                    ExpressionAttributeNames={'#status': 'status'},
+                    ExpressionAttributeValues={
+                        ':status': status,
+                        ':manifest': manifest_path,
+                        ':updated': datetime.utcnow().isoformat()
+                    }
+                )
+                updated += 1
+            except Exception as e:
+                logger.error(f"✗ Error updating {file_info['filename']}: {str(e)}")
+
+        logger.info(f"✓ Updated {updated}/{len(files)} file statuses")
+
+    except Exception as e:
+        logger.error(f"✗ Error in _update_file_status: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+
+
+def start_step_function(manifest_path: str, date_prefix: str, file_count: int) -> Optional[str]:
+    """Start Step Functions workflow to process manifest."""
+    if not STEP_FUNCTION_ARN:
+        logger.warning("⚠️  STEP_FUNCTION_ARN not set, skipping Step Function trigger")
+        return None
+
+    try:
+        logger.info(f"🚀 Starting Step Function execution for manifest: {manifest_path}")
+
+        response = sfn_client.start_execution(
+            stateMachineArn=STEP_FUNCTION_ARN,
+            input=json.dumps({
+                'manifest_path': manifest_path,
+                'date_prefix': date_prefix,
+                'file_count': file_count,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+        )
+
+        execution_arn = response['executionArn']
+        logger.info(f"✓ Started Step Function execution: {execution_arn}")
+        return execution_arn
+
+    except Exception as e:
+        logger.error(f"✗ Failed to start Step Function: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return None
