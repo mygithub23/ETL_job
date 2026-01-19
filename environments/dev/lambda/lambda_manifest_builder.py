@@ -5,7 +5,7 @@ Lambda #1: Manifest Builder - DEVELOPMENT VERSION
 Enhanced version with extensive logging, try-catch blocks, and debugging features.
 
 Author: Data Engineering Team
-Version: 1.2.0-dev
+Version: 1.3.0-dev
 Environment: DEVELOPMENT
 
 Features:
@@ -13,6 +13,7 @@ Features:
 - Try-catch blocks with full stack traces
 - Object introspection and dumps
 - Debug mode for verbose output
+- End-of-day flush: Processes orphaned files from previous days automatically
 """
 
 import json
@@ -22,7 +23,7 @@ import hashlib
 import time
 import re
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import List, Dict, Tuple, Optional
 import logging
@@ -55,9 +56,15 @@ LOCK_TABLE = os.environ.get('LOCK_TABLE', TRACKING_TABLE)
 LOCK_TTL_SECONDS = int(os.environ.get('LOCK_TTL_SECONDS', '300'))
 STEP_FUNCTION_ARN = os.environ.get('STEP_FUNCTION_ARN', '')
 
+# End-of-day flush configuration
+# MIN_FILES_FOR_PARTIAL_BATCH: Minimum files needed to create a partial batch for previous days
+# Set to 1 to process any orphaned files, or higher to require a minimum batch size
+MIN_FILES_FOR_PARTIAL_BATCH = int(os.environ.get('MIN_FILES_FOR_PARTIAL_BATCH', '1'))
+
 # Log all configuration
 logger.info(f"Configuration: MAX_FILES_PER_MANIFEST={MAX_FILES_PER_MANIFEST}, EXPECTED_FILE_SIZE_MB={EXPECTED_FILE_SIZE_MB}")
 logger.info(f"Configuration: SIZE_TOLERANCE_PERCENT={SIZE_TOLERANCE_PERCENT}, LOCK_TTL_SECONDS={LOCK_TTL_SECONDS}")
+logger.info(f"Configuration: MIN_FILES_FOR_PARTIAL_BATCH={MIN_FILES_FOR_PARTIAL_BATCH}")
 
 # DynamoDB table
 table = dynamodb.Table(TRACKING_TABLE)
@@ -86,7 +93,7 @@ class DistributedLock:
                     'file_key': 'LOCK',  # Range key in DynamoDB
                     'lock_id': self.lock_id,
                     'ttl': ttl,
-                    'created_at': datetime.utcnow().isoformat()
+                    'created_at': datetime.now(timezone.utc).isoformat()
                 },
                 ConditionExpression='attribute_not_exists(date_prefix) OR #ttl < :now',
                 ExpressionAttributeNames={'#ttl': 'ttl'},
@@ -330,7 +337,7 @@ def extract_date_and_filename(key: str) -> Tuple[str, str]:
             date_prefix = match.group(1)
         else:
             # Fallback to current date
-            date_prefix = datetime.utcnow().strftime('%Y-%m-%d')
+            date_prefix = datetime.now(timezone.utc).strftime('%Y-%m-%d')
             logger.warning(f"⚠️  No date found in key, using current date: {date_prefix}")
 
         logger.debug(f"Extracted: date={date_prefix}, filename={filename}")
@@ -352,7 +359,7 @@ def track_file(bucket: str, key: str, date_prefix: str, file_name: str, size: in
             'file_path': f's3://{bucket}/{key}',
             'file_size_mb': Decimal(str(size / (1024 * 1024))),
             'status': 'pending',
-            'created_at': datetime.utcnow().isoformat()
+            'created_at': datetime.now(timezone.utc).isoformat()
         }
 
         logger.debug(f"📝 Writing to DynamoDB: {json.dumps(item, indent=2, default=str)}")
@@ -368,7 +375,15 @@ def track_file(bucket: str, key: str, date_prefix: str, file_name: str, size: in
 
 
 def create_manifests_if_ready(date_prefix: str) -> int:
-    """Check if ready to create manifests based on file count threshold."""
+    """
+    Check if ready to create manifests based on file count threshold.
+
+    For current day: Requires MAX_FILES_PER_MANIFEST files to create a batch.
+    For previous days: Creates partial batch with any remaining files (orphan flush).
+
+    This prevents files from being stranded when the day changes before
+    reaching the full batch threshold.
+    """
     lock = DistributedLock(LOCK_TABLE, f'manifest-{date_prefix}', LOCK_TTL_SECONDS)
 
     try:
@@ -393,15 +408,33 @@ def create_manifests_if_ready(date_prefix: str) -> int:
         if len(all_files) > 5:
             logger.debug(f"   ... and {len(all_files) - 5} more files")
 
+        # Determine if this is a previous day (orphan flush scenario)
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        is_previous_day = date_prefix < today
+
+        if is_previous_day:
+            logger.info(f"📅 Date {date_prefix} is from a previous day (today: {today})")
+            logger.info(f"🔄 Triggering end-of-day flush for orphaned files")
+
+        # Determine the threshold for creating a manifest
+        # For previous days: use MIN_FILES_FOR_PARTIAL_BATCH (flush orphans)
+        # For current day: use MAX_FILES_PER_MANIFEST (normal batching)
+        effective_threshold = MIN_FILES_FOR_PARTIAL_BATCH if is_previous_day else MAX_FILES_PER_MANIFEST
+
         # Check if we have enough files to create a manifest
-        if len(all_files) < MAX_FILES_PER_MANIFEST:
-            logger.info(f"ℹ️  Not enough files yet: {len(all_files)} < {MAX_FILES_PER_MANIFEST}")
+        if len(all_files) < effective_threshold:
+            logger.info(f"ℹ️  Not enough files yet: {len(all_files)} < {effective_threshold}")
             return 0
 
-        logger.info(f"✓ File threshold reached! Creating manifests...")
+        if is_previous_day:
+            logger.info(f"✓ Processing {len(all_files)} orphaned files from {date_prefix}")
+        else:
+            logger.info(f"✓ File threshold reached! Creating manifests...")
 
-        # Create batches (each batch has MAX_FILES_PER_MANIFEST files)
-        batches = _create_batches(all_files)
+        # Create batches
+        # For previous days: include partial batches (flush all remaining)
+        # For current day: only full batches
+        batches = _create_batches(all_files, allow_partial=is_previous_day)
         logger.info(f"📦 Created {len(batches)} batch(es)")
 
         for i, batch in enumerate(batches, 1):
@@ -495,21 +528,37 @@ def _get_pending_files(date_prefix: str) -> List[Dict]:
         return []
 
 
-def _create_batches(files: List[Dict]) -> List[List[Dict]]:
-    """Create batches based on MAX_FILES_PER_MANIFEST."""
+def _create_batches(files: List[Dict], allow_partial: bool = False) -> List[List[Dict]]:
+    """
+    Create batches based on MAX_FILES_PER_MANIFEST.
+
+    Args:
+        files: List of file dictionaries to batch
+        allow_partial: If True, include the last partial batch (for orphan flush).
+                      If False, only create full batches.
+
+    Returns:
+        List of batches, where each batch is a list of file dictionaries.
+    """
     try:
-        logger.debug(f"📦 Creating batches from {len(files)} files (max {MAX_FILES_PER_MANIFEST} per batch)")
+        logger.debug(f"📦 Creating batches from {len(files)} files (max {MAX_FILES_PER_MANIFEST} per batch, allow_partial={allow_partial})")
 
         batches = []
 
         # Split files into batches of MAX_FILES_PER_MANIFEST
         for i in range(0, len(files), MAX_FILES_PER_MANIFEST):
             batch = files[i:i + MAX_FILES_PER_MANIFEST]
-            # Only create full batches (don't create partial batches)
+
             if len(batch) == MAX_FILES_PER_MANIFEST:
+                # Full batch - always include
                 batches.append(batch)
                 batch_size_mb = sum(f['size_bytes'] for f in batch) / (1024**2)
-                logger.debug(f"   Batch {len(batches)}: {len(batch)} files, {batch_size_mb:.2f}MB")
+                logger.debug(f"   Batch {len(batches)}: {len(batch)} files (full), {batch_size_mb:.2f}MB")
+            elif allow_partial and len(batch) >= MIN_FILES_FOR_PARTIAL_BATCH:
+                # Partial batch - only include if allow_partial is True (orphan flush)
+                batches.append(batch)
+                batch_size_mb = sum(f['size_bytes'] for f in batch) / (1024**2)
+                logger.debug(f"   Batch {len(batches)}: {len(batch)} files (partial/orphan flush), {batch_size_mb:.2f}MB")
             else:
                 logger.debug(f"   Holding partial batch: {len(batch)} files (need {MAX_FILES_PER_MANIFEST})")
 
@@ -525,7 +574,7 @@ def _create_batches(files: List[Dict]) -> List[List[Dict]]:
 def _create_manifest(date_prefix: str, batch_idx: int, files: List[Dict]) -> Optional[str]:
     """Create manifest file with logging."""
     try:
-        timestamp = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
         manifest_key = f'manifests/{date_prefix}/batch-{batch_idx:04d}-{timestamp}.json'
 
         logger.debug(f"📝 Creating manifest: {manifest_key}")
@@ -579,7 +628,7 @@ def _update_file_status(files: List[Dict], status: str, manifest_path: str):
                     ExpressionAttributeValues={
                         ':status': status,
                         ':manifest': manifest_path,
-                        ':updated': datetime.utcnow().isoformat()
+                        ':updated': datetime.now(timezone.utc).isoformat()
                     }
                 )
                 updated += 1
@@ -608,7 +657,7 @@ def start_step_function(manifest_path: str, date_prefix: str, file_count: int) -
                 'manifest_path': manifest_path,
                 'date_prefix': date_prefix,
                 'file_count': file_count,
-                'timestamp': datetime.utcnow().isoformat()
+                'timestamp': datetime.now(timezone.utc).isoformat()
             })
         )
 
